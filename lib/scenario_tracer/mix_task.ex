@@ -10,7 +10,20 @@ defmodule ScenarioTracer.MixTask do
   @callback trace_dir(String.t()) :: String.t()
   @callback frameworks() :: [module()]
 
-  alias ExTracer.{CallTracer, CoverageReport, FlowExpander, FlowHints, FlowSummary, PerformanceReport, Report, TestScanner}
+  alias ExTracer.{
+    CallTracer,
+    CoverageReport,
+    FlowExpander,
+    FlowHints,
+    FlowSummary,
+    ModuleIndex,
+    PerformanceReport,
+    Report,
+    RuntimeNormalizer,
+    TestScanner
+  }
+
+  alias ScenarioTracer.FlowResolver
 
   def run(mod, args \\ []) do
     started = System.monotonic_time(:millisecond)
@@ -21,8 +34,10 @@ defmodule ScenarioTracer.MixTask do
     lookup = mod.lookup_builder(project_root, nodes, runtime)
     adapters = mod.adapters()
 
-    if args != [:static_only] do
-      _ = Mix.Task.run("test", args)
+    {mix_test_args, static_only?} = normalize_args(args)
+
+    if not static_only? do
+      _ = Mix.Task.run("test", mix_test_args)
     end
 
     scenarios =
@@ -30,6 +45,7 @@ defmodule ScenarioTracer.MixTask do
       |> Path.join("test/**/*.{ex,exs}")
       |> Path.wildcard()
       |> Enum.flat_map(&extract_file(&1, mod.frameworks(), lookup, adapters))
+      |> Enum.uniq_by(&{&1.id, &1.source_file})
 
     duration_ms = System.monotonic_time(:millisecond) - started
 
@@ -51,67 +67,143 @@ defmodule ScenarioTracer.MixTask do
       source_module = extract_module_name(ast)
 
       Enum.flat_map(frameworks, fn framework ->
-        TestScanner.extract_from_ast(ast, source_module, file_path, alias_map, framework, fn describe_name,
-                                                                                           body,
-                                                                                           source_module,
-                                                                                           file_path,
-                                                                                           alias_map,
-                                                                                           metadata_attrs,
-                                                                                           test_kinds ->
-          scenario_id = TestScanner.generate_scenario_id(source_module, describe_name)
-          scenario_meta = TestScanner.extract_scenario_metadata(body, metadata_attrs)
+        TestScanner.extract_from_ast(
+          ast,
+          source_module,
+          file_path,
+          alias_map,
+          framework,
+          fn describe_name,
+             body,
+             source_module,
+             file_path,
+             alias_map,
+             metadata_attrs,
+             test_kinds ->
+            scenario_id = TestScanner.generate_scenario_id(source_module, describe_name)
+            scenario_meta = TestScanner.extract_scenario_metadata(body, metadata_attrs)
 
-          traced_tests =
-            body
-            |> TestScanner.extract_test_blocks(test_kinds)
-            |> Enum.map(fn test_block ->
-              executed_flow = CallTracer.collect_executed_trace(test_block, alias_map, lookup, adapters)
-              flow = Enum.flat_map(executed_flow, &FlowExpander.expand_step(&1, lookup, adapters))
+            traced_tests =
+              body
+              |> TestScanner.extract_test_blocks(test_kinds)
+              |> Enum.map(fn test_block ->
+                executed_flow =
+                  CallTracer.collect_executed_trace(test_block, alias_map, lookup, adapters)
 
-              %{
-                flow: flow,
-                executed_flow: executed_flow,
-                runtime_trace: lookup.runtime |> Map.get(scenario_id, []) |> Enum.find(&ScenarioTracer.TraceStore.JsonFile.match(&1, test_block.name)),
-                test_case: %{name: test_block.name, kind: test_block.kind, file: file_path, line: test_block.line}
-              }
-            end)
-            |> Enum.filter(&(Enum.any?(&1.flow) or not is_nil(&1.runtime_trace)))
+                flow =
+                  Enum.flat_map(executed_flow, &FlowExpander.expand_step(&1, lookup, adapters))
 
-          if traced_tests == [] do
-            []
-          else
-            flow_hints = FlowHints.normalize_flow_hints(Map.get(scenario_meta, :flow), lookup)
+                runtime_trace =
+                  lookup.runtime
+                  |> Map.get(scenario_id, [])
+                  |> Enum.find(&ScenarioTracer.TraceStore.JsonFile.match(&1, test_block.name))
 
-            flow =
-              traced_tests
-              |> Enum.flat_map(& &1.flow)
-              |> FlowSummary.assign_step_ids()
-              |> FlowSummary.attach_focus_targets()
-              |> FlowHints.merge_flow_hints(flow_hints)
+                %{
+                  static_flow: flow,
+                  executed_flow: executed_flow,
+                  runtime_trace: runtime_trace,
+                  test_case: %{
+                    name: test_block.name,
+                    kind: test_block.kind,
+                    file: file_path,
+                    line: test_block.line
+                  }
+                }
+              end)
+              |> Enum.filter(&(Enum.any?(&1.static_flow) or not is_nil(&1.runtime_trace)))
 
-            {nodes, graph_path} = FlowSummary.derive_flow_summaries(flow)
+            if traced_tests == [] do
+              []
+            else
+              flow_hints = FlowHints.normalize_flow_hints(Map.get(scenario_meta, :flow), lookup)
 
-            [
-              %ExTracer.Scenario{
-                id: scenario_id,
-                name: to_string(describe_name),
-                category: infer_category(scenario_meta, traced_tests),
-                level: infer_level(traced_tests, lookup),
-                source_file: file_path,
-                source_module: source_module,
-                evidence_mode: :static,
-                trace_status: :missing,
-                nodes: nodes,
-                graph_path: graph_path,
-                compliance_links: ExTracer.Utils.normalize_string_list(Map.get(scenario_meta, :compliance_links)),
-                flow: flow,
-                evidence_summary: FlowSummary.summarize_evidence(flow),
-                tests: Enum.map(traced_tests, & &1.test_case),
-                tags: TestScanner.normalize_tags(Map.get(scenario_meta, :tags) || [])
-              }
-            ]
+              traced_test_flows =
+                traced_tests
+                |> Enum.map(fn traced_test ->
+                  runtime_flow =
+                    RuntimeNormalizer.normalize(
+                      traced_test.runtime_trace,
+                      traced_test.test_case,
+                      lookup,
+                      adapters
+                    )
+
+                  resolved =
+                    FlowResolver.resolve(
+                      traced_test.static_flow,
+                      runtime_flow,
+                      lookup,
+                      adapters
+                    )
+
+                  %{
+                    test_name: traced_test.test_case.name,
+                    static_flow: traced_test.static_flow,
+                    runtime_flow: runtime_flow,
+                    resolved_flow: resolved.resolved_flow
+                  }
+                end)
+
+              normalized_page_flow =
+                ScenarioTracer.PageTraceNormalizer.normalize(traced_test_flows, lookup)
+
+              flow =
+                normalized_page_flow.canonical_flow
+                |> FlowHints.merge_flow_hints(flow_hints)
+                |> materialize_flow()
+
+              static_flow = materialize_flow(normalized_page_flow.static_flow)
+              runtime_flow = materialize_flow(normalized_page_flow.runtime_flow)
+              raw_flow = materialize_flow(normalized_page_flow.raw_flow)
+              raw_test_flows = materialize_test_flows(normalized_page_flow.raw_test_flows)
+              static_test_flows = materialize_test_flows(normalized_page_flow.static_test_flows)
+              runtime_test_flows = materialize_test_flows(normalized_page_flow.runtime_test_flows)
+
+              resolved_test_flows =
+                materialize_test_flows(normalized_page_flow.resolved_test_flows)
+
+              test_flows = resolved_test_flows
+
+              {nodes, graph_path} = FlowSummary.derive_flow_summaries(flow)
+
+              has_runtime =
+                Enum.any?(traced_tests, fn traced_test ->
+                  not is_nil(traced_test.runtime_trace)
+                end)
+
+              [
+                %ExTracer.Scenario{
+                  id: scenario_id,
+                  name: to_string(describe_name),
+                  category: infer_category(scenario_meta, traced_tests),
+                  level: infer_level(traced_tests, lookup),
+                  source_file: file_path,
+                  source_module: source_module,
+                  evidence_mode: if(has_runtime, do: :runtime, else: :static),
+                  trace_status: if(has_runtime, do: :present, else: :missing),
+                  nodes: nodes,
+                  graph_path: graph_path,
+                  compliance_links:
+                    ExTracer.Utils.normalize_string_list(
+                      Map.get(scenario_meta, :compliance_links)
+                    ),
+                  flow: flow,
+                  static_flow: static_flow,
+                  runtime_flow: runtime_flow,
+                  raw_flow: raw_flow,
+                  raw_test_flows: raw_test_flows,
+                  static_test_flows: static_test_flows,
+                  runtime_test_flows: runtime_test_flows,
+                  resolved_test_flows: resolved_test_flows,
+                  test_flows: test_flows,
+                  evidence_summary: FlowSummary.summarize_evidence(flow),
+                  tests: Enum.map(traced_tests, & &1.test_case),
+                  tags: TestScanner.normalize_tags(Map.get(scenario_meta, :tags) || [])
+                }
+              ]
+            end
           end
-        end)
+        )
       end)
     else
       _ -> []
@@ -120,16 +212,38 @@ defmodule ScenarioTracer.MixTask do
 
   defp infer_category(meta, traced_tests) do
     cond do
-      category = Map.get(meta, :category) -> category
-      Enum.any?(ExTracer.Utils.normalize_string_list(Map.get(meta, :compliance_links))) -> :compliance
-      Enum.any?(traced_tests, &(&1.test_case.kind == :property)) -> :property
-      true -> :invariant
+      category = Map.get(meta, :category) ->
+        category
+
+      Enum.any?(ExTracer.Utils.normalize_string_list(Map.get(meta, :compliance_links))) ->
+        :compliance
+
+      Enum.any?(traced_tests, &(&1.test_case.kind == :property)) ->
+        :property
+
+      true ->
+        :invariant
     end
   end
 
   defp infer_level(traced_tests, lookup) do
-    _ = {traced_tests, lookup}
-    nil
+    traced_tests
+    |> Enum.flat_map(&Map.get(&1, :executed_flow, []))
+    |> Enum.map(&ModuleIndex.entry_point_level(&1, lookup))
+    |> Enum.reject(&is_nil/1)
+    |> highest_level()
+  end
+
+  defp highest_level(levels) do
+    cond do
+      :webhook in levels -> :webhook
+      :job in levels -> :job
+      :transfer in levels -> :transfer
+      :reactor in levels -> :reactor
+      :action in levels -> :action
+      :rule in levels -> :rule
+      true -> nil
+    end
   end
 
   defp extract_alias_map(ast) do
@@ -177,11 +291,14 @@ defmodule ScenarioTracer.MixTask do
       covered_nodes: covered_count,
       coverage_pct: if(total == 0, do: 0.0, else: covered_count / total * 100.0),
       uncovered_node_ids: Enum.reject(Enum.map(nodes, & &1.id), &(&1 in covered)),
-      coverage_by_type: nodes |> Enum.group_by(& &1.type) |> Map.new(fn {type, typed} ->
-        typed_ids = Enum.map(typed, & &1.id)
-        type_covered = Enum.count(typed_ids, &(&1 in covered))
-        {type, if(typed == [], do: 0.0, else: type_covered / length(typed) * 100.0)}
-      end)
+      coverage_by_type:
+        nodes
+        |> Enum.group_by(& &1.type)
+        |> Map.new(fn {type, typed} ->
+          typed_ids = Enum.map(typed, & &1.id)
+          type_covered = Enum.count(typed_ids, &(&1 in covered))
+          {type, if(typed == [], do: 0.0, else: type_covered / length(typed) * 100.0)}
+        end)
     }
   end
 
@@ -192,9 +309,15 @@ defmodule ScenarioTracer.MixTask do
 
     %PerformanceReport{
       total_test_duration_ms: Enum.sum(durations),
-      slowest_tests: Enum.map(Enum.take(ordered, 10), &{&1.scenario_id, &1.test_name, &1.duration_ms}),
-      fastest_tests: Enum.map(Enum.take(Enum.reverse(ordered), 10), &{&1.scenario_id, &1.test_name, &1.duration_ms}),
-      avg_duration_ms: if(durations == [], do: 0.0, else: Enum.sum(durations) / length(durations)),
+      slowest_tests:
+        Enum.map(Enum.take(ordered, 10), &{&1.scenario_id, &1.test_name, &1.duration_ms}),
+      fastest_tests:
+        Enum.map(
+          Enum.take(Enum.reverse(ordered), 10),
+          &{&1.scenario_id, &1.test_name, &1.duration_ms}
+        ),
+      avg_duration_ms:
+        if(durations == [], do: 0.0, else: Enum.sum(durations) / length(durations)),
       extraction_duration_ms: extraction_duration_ms
     }
   end
@@ -205,5 +328,35 @@ defmodule ScenarioTracer.MixTask do
         Map.update(inner, node_id, [scenario.id], &[scenario.id | &1])
       end)
     end)
+  end
+
+  defp materialize_flow(flow) do
+    flow
+    |> FlowSummary.assign_step_ids()
+    |> FlowSummary.attach_focus_targets()
+  end
+
+  defp materialize_test_flows(test_flows) do
+    Enum.map(test_flows, fn %{test_name: test_name, flow: flow} ->
+      %{test_name: test_name, flow: materialize_flow(flow)}
+    end)
+  end
+
+  defp normalize_args(args) do
+    static_only? =
+      Enum.any?(args, fn
+        :static_only -> true
+        "--static-only" -> true
+        _ -> false
+      end)
+
+    mix_test_args =
+      Enum.reject(args, fn
+        :static_only -> true
+        "--static-only" -> true
+        _ -> false
+      end)
+
+    {mix_test_args, static_only?}
   end
 end
